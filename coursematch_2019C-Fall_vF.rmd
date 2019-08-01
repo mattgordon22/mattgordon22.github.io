@@ -1,0 +1,497 @@
+---
+title: "CourseMatch Analytics - Fall 2019"
+subtitle: "Data Processing for Google Sheet"
+date: "`r format(Sys.time(), '%Y-%m-%d')`"
+output:
+  bookdown::html_document2:
+    #css: css/analysis.css
+    code_folding: show
+    df_print: paged
+    number_sections: yes
+    self-contained: true
+    fig_caption: yes
+    toc: true
+    toc_float: true
+params:
+  external_queries: false
+---
+
+## Summary
+
+This notebook documents how we built the [Google Sheet](https://docs.google.com/spreadsheets/d/1DnAfsboI4Ucwdge8tRcG86ckb5WK5EdPd6FXdiqaesE/) with course and instructor evaluations and clearing prices
+
+## Setup
+
+```{r setup, include = TRUE}
+#setwd("<insert path>")
+
+# knitr options
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.align = 'center',
+                      fig.width = 9, fig.height = 8, cache = FALSE)
+
+# Forces any incline R to only have 2 digits and a comma for the thounsands place
+knitr::knit_hooks$set(inline = function(x) {if(!is.numeric(x)){ x }else{ prettyNum(round(x,2), big.mark=",") } })
+
+# Don't show scientific notation and only 3 digits
+options(scipen = 999, digits = 3)
+
+# Load packages
+pacman::p_load(tidyverse, readxl, stringr, lubridate, googlesheets, rvest, forcats, 
+               grid, gridExtra, htmlTable, highcharter)
+
+# Token to connect to Google Drive/Sheets
+# token <- drive_auth(cache = FALSE)
+# saveRDS(token, file = "googlesheets_token.rds")
+# suppressMessages(gs_auth(token = "googlesheets_token.rds", verbose = FALSE))
+
+# Create corresponding folders in working directory
+data_path <- "data/"; viz_path <- "viz/"
+
+#Set ggplot theme
+ggplot2::theme_set(theme_minimal() + 
+                     theme(legend.position="top", plot.caption = element_text(size = 8), 
+                           panel.grid.minor.x = element_blank(), 
+                           strip.background = element_rect(fill = "grey85", colour = "grey85"),
+                           legend.margin=margin(t = -0.3, r = 0, b = -0.4, l=0, unit="cm")))
+
+wharton_col <- c("#004785", "#A90533", "#A262460", "#282F85", "#026CB5", "#06AAFC",
+                 "#532A85","#96227D", "#A8204E","#C5093B","#2D2C41","#D7BC6A",
+                 "#B2B6A7","EEEDEA")
+names(wharton_col) <- c("wharton_blue", 'wharton_red','midnight_blue','atlantic_blue','pacific_blue','bay_blue',
+                        'evening_red','sunset_red','brick_red','heritage_red','night_street','morning_yellow',
+                        'college_grey','marine_grey')
+
+hcoptslang <- getOption("highcharter.lang")
+hcoptslang$thousandsSep <- ","
+hcoptslang$numericSymbols <- c("k", "M", "B", "T", "P", "E")
+options(highcharter.lang = hcoptslang)
+```
+
+
+# Data Acquisition
+
+## Course Match Sections
+
+To get all sections listed in Course Match, we extract the table from the Course Match html.
+(https://apps.wharton.upenn.edu/coursematch/index.cfm), select "FALL 2019 MBA COURSES", then click "Go".
+Save this CourseMatch interface page as a .html file in the data folder.
+Some courses are cross-listed and we create a column to include the other sections a course can be listed as. We also gather credit units and the quarter taught here.
+The extract comes from a 2Y view, so 1Y courses like WHCP, MGEC, and other fixed core are not included.
+
+```{r parse-coursematch-html}
+# List of sections available for selection within CourseMatch
+coursematch_sections <- 
+  read_html(paste0(data_path, "Course Match.html")) %>%
+  html_node(xpath = '//*[@id="preferences-table"]') %>%
+  html_table(header = TRUE, trim = TRUE) %>%
+  as_tibble() %>%
+  select(1,4) %>%
+  rename_at(vars(contains("Dept")), funs(paste0("Course_Multiple"))) %>%
+  rename_at(vars(contains("Qtr")), funs(paste0("Qtr"))) %>%
+  mutate(Section = str_sub(Course_Multiple, start = 0, end = 10)) %>%
+  mutate(cross_listed_as = str_sub(Course_Multiple, start = 11, end = 30)) %>%
+  mutate(cross_listed_as = if_else(cross_listed_as == "", NA_character_, cross_listed_as)) %>%
+  filter(Section != "Course") %>%
+  select(Section, cross_listed_as, Qtr) %>%
+  rowwise() %>%
+  mutate(cross_listed_as = if_else(cross_listed_as == "", NA_character_, 
+                                   paste0(str_extract_all(cross_listed_as, 
+                                                          "[A-Z]{4}[0-9]{6}", simplify = TRUE), collapse = ", "))) %>%
+  mutate(Qtr = str_replace(Qtr, "tr ", "")) %>%
+  ungroup()
+
+# Unique listing of courses and their cross-list assigned master course
+course_map <- 
+  read_html(paste0(data_path, "Course Match.html")) %>%
+  html_node(xpath = '//*[@id="preferences-table"]') %>%
+  html_table(header = TRUE, trim = TRUE) %>%
+  as_tibble() %>%
+  select(1) %>%
+  rename_at(vars(contains("Dept")), funs(paste0("Course_Multiple"))) %>%
+  filter(Course_Multiple != "Course") %>%
+  mutate(Course_Multiple = str_extract_all(Course_Multiple, "[A-Z]{4}[0-9]{3}")) %>%
+  rowwise() %>%
+  mutate(Course_Key = min(Course_Multiple)) %>%
+  ungroup() %>%
+  unnest() %>%
+  select("Course_Lookup" = Course_Multiple, Course_Key) %>%
+  distinct(Course_Lookup, Course_Key)
+
+```
+
+
+## Course Information
+
+To get all the information about the courses, we can use the *export* feature on [MyWharton](https://apps.wharton.upenn.edu/reportsv2/1254/?term=2019C&submit=GO). Unfortunately, this contains non-MBA classes too (ungrad and PhD).
+Use the "Excel" export function just above the main course data table.
+Save the resulting exported file in the data folder under "Course Info.xlsx"
+
+```{r load-all-wharton-courses}
+course_info <- 
+  readxl::read_excel(paste0(data_path, "Course Info.xlsx"), skip = 1)
+```
+
+
+## Course Evaluations
+
+Course evaluation also comes from a [MyWharton export](https://apps.wharton.upenn.edu/reportsv2/1253/).
+Use the "Excel" export function just above the main course data table.
+Save the resulting exported file in the data folder under "Course Evals.xlsx"
+
+```{r load-course-eval-data}
+evals <- 
+  readxl::read_excel(paste0(data_path, "Course Evals.xlsx"), skip = 1
+                     , col_types = c("text", "text", "text", "text", "numeric", "numeric", "numeric", "numeric", "numeric", "numeric", "numeric", "numeric", "numeric", "numeric", "numeric")
+                     ) %>% 
+  filter(n() != row_number()) %>%
+  filter(Term >= "2017C")
+```
+
+
+## Clearing Prices
+
+Clearing price data comes the **public** [MBA Inside website](https://mba-inside.wharton.upenn.edu/course-match/). We save the files corresponding to the last 4 semesters, from Fall 2017 to Spring 2019
+
+```{r download-clearing-prices}
+
+# Function to load each xlsx file of clearing prices
+# Need to have a switch because the Fall 2013 file
+# contains an extra row at the top
+fn_load_clearing_price_xlsx <- function(file_name) {
+  if (str_detect(file_name, "13")) {
+    readxl::read_excel(file_name, skip = 1)
+  } else {
+    readxl::read_excel(file_name, skip = 0)
+  }
+}
+
+# Function to rename the columns that 
+# look like 'section' and 'price' to Section
+# and Price so that they can be binded
+fn_rename_at <- function(df, string) {
+  df %>%
+    rename_at(vars(matches(string)), funs(paste0(string)))
+}
+
+# Load and coalesce each of the clearing price
+# Excel files
+clearing_prices <- 
+  list.files(paste0(data_path, "clearing_prices/"), full.names = TRUE) %>%
+  map(fn_load_clearing_price_xlsx) %>%
+  map(select, matches("Section|Price")) %>%
+  map(fn_rename_at, string = "Section") %>%
+  map(fn_rename_at, string = "Price") %>%
+  bind_rows() %>%
+  mutate(Course = str_sub(Section, 1, 7)) %>%
+  select(Course, Section, Price)
+```
+
+# Data Cleaning
+
+After acquiring data from the four data sources we need to do some combining and cleaning.
+
+```{r course_quilt}
+course_quilt <- 
+  course_info %>%
+  select(`Section ID`, `Course Title`, Instructor, CU, Meeting) %>%
+  rename("Section" = `Section ID`, "Title" = `Course Title`) %>%
+  distinct() %>%
+  mutate(Section = strsplit(as.character(Section), " / ")) %>% 
+  unnest(Section) %>%
+  select(Section, everything()) %>%
+  inner_join(coursematch_sections, by = "Section") %>%
+  arrange(Section) %>%
+  mutate(
+    Course = str_sub(Section, 1, 7)
+    , SectionNo = str_sub(Section, 8, 10)
+    , Dept = str_sub(Section, 1, 4)
+    , Dates = str_sub(Meeting, 0, 23)
+    , Days = str_replace(str_sub(Meeting, start = 24, end = 26), pattern = ":", replacement = "")
+    , start_time = str_sub(Meeting, start = str_length(Meeting) - 14, end = str_length(Meeting) - 9)
+    , end_time = str_sub(Meeting, start = str_length(Meeting) - 5, end = str_length(Meeting))
+    , Title = str_to_title(Title)
+  ) %>%
+  mutate(Instructor_a = str_split_fixed(string = Instructor, pattern = ", ", n = 3)[,1],
+         Instructor_b = replace_na(str_split_fixed(string = Instructor, pattern = ", ", n = 3)[,2], replace = ""),
+         Instructor_c = replace_na(str_split_fixed(string = Instructor, pattern = ", ", n = 3)[,3], replace = "")) %>%
+  mutate(Instructor_a = na_if(Instructor_a, "")
+         , Instructor_b = na_if(Instructor_b, "")
+         , Instructor_c = na_if(Instructor_c, "")
+         ) %>%
+  mutate(
+    Instructor_1 = pmin(Instructor_a, Instructor_b, Instructor_c, na.rm = TRUE)
+    , Instructor_2 = ifelse(is.na(Instructor_b), NA, 
+                               ifelse(is.na(Instructor_c), pmax(Instructor_a, Instructor_b, na.rm = TRUE), 
+                                      pmin(ifelse(Instructor_1 == Instructor_a, NA, Instructor_a), 
+                                           ifelse(Instructor_1 == Instructor_b, NA, Instructor_b), 
+                                           ifelse(Instructor_1 == Instructor_c, NA, Instructor_c), na.rm = TRUE)))
+    , Instructor_3 = ifelse(is.na(Instructor_c), NA, pmax(Instructor_a, Instructor_b, Instructor_c))) %>%
+  mutate(
+    Instructor_1_Last = if_else(Instructor_1 == "ECKSTEIN Z", "ECKSTEIN", str_to_upper(str_extract(Instructor_1, "[:alpha:]+$")))
+    , Instructor_1_First = if_else(Instructor_1 == "ECKSTEIN Z", "ZVI", str_to_upper(str_extract(Instructor_1, "^[:alpha:]+")))
+    , Instructor_2_Last = if_else(Instructor_2 == "ECKSTEIN Z", "ECKSTEIN", str_to_upper(str_extract(Instructor_2, "[:alpha:]+$")))
+    , Instructor_2_First = if_else(Instructor_2 == "ECKSTEIN Z", "ZVI", str_to_upper(str_extract(Instructor_2, "^[:alpha:]+")))
+    , Instructor_3_Last = if_else(Instructor_3 == "ECKSTEIN Z", "ECKSTEIN", str_to_upper(str_extract(Instructor_3, "[:alpha:]+$")))
+    , Instructor_3_First = if_else(Instructor_3 == "ECKSTEIN Z", "ZVI", str_to_upper(str_extract(Instructor_3, "^[:alpha:]+")))
+  ) %>%
+  mutate(
+    cross_list_1 = str_sub(cross_listed_as, 1, 10)
+    , cross_list_2 = na_if(str_sub(cross_listed_as, 13, 22), "")
+  ) %>%
+  left_join(course_map, by = c("Course" = "Course_Lookup")) %>%
+  select(Section, Course, SectionNo, Title, Instructor, Dept, CU, Days, Qtr, start_time, end_time, cross_listed_as, Instructor_1, Instructor_2, Instructor_3, cross_list_1, cross_list_2, Course_Key, Instructor_1_Last, Instructor_1_First, Instructor_2_Last, Instructor_2_First, Instructor_3_Last, Instructor_3_First)
+
+```
+
+```{r tbl_questions}
+tbl_questions <- tribble(
+  ~question_type, ~question, ~question_abbr
+  , 'Course', 'Overall Quality of Course (0=worst 4=best)', 'Course Quality'
+  , 'Course', 'Value of Assigned Readings (0=worst 4=best)', 'Value of Assigned Readings'
+  , 'Course', 'Learned from this Course in terms of Knowledge/Concepts/Skills/Thinking Ability (0=worst 4=best)', 'Amount Learned'
+  , 'Course', 'Rate the Difficulty of this Course (0=easiest 4=hardest)', 'Difficulty'
+  , 'Course', 'Rate the Amount of Work Required for this Course (0=easiest 4=hardest)', 'Amount of Work Required'
+  , 'Course', 'Would you Recommend this Course to a Major? (4=most strongly)', 'Recommend to Major'
+  , 'Course', 'Would you Recommend this Course to a Non-Major? (4=most strongly)', 'Recommend to Non-Major'
+  , 'Instructor', 'Overall Quality of Instructor (0=worst 4=best)', 'Instructor Quality'
+  , 'Instructor', 'Instructor Ability to Communicate Subject Matter (0=worst 4=best)', 'Ability to Communicate Subject Matter'
+  , 'Instructor',  'Instructor Ability to Stimulate Student Interest (0=worst 4=best)', 'Ability to Stimulate Interest'
+  , 'Instructor', 'Instructor Accessibility/Willingness to Discuss Course Content/Problems (0=worst 4=best)', 'Instructor Accessibility'  
+) %>%
+  mutate(
+    question_type = fct_inorder(question_type)
+    , question_abbr = fct_inorder(question_abbr)
+  )
+```
+
+```{r evals_cleaned}
+evals_cleaned <- 
+  evals %>%
+  gather(question, value, -Term, -Section, -Title, -Instructor) %>%
+  left_join(tbl_questions, by = 'question') %>%
+  select(-question) %>%
+  mutate(
+    Year = str_sub(Term, 1,4)
+    , Course = str_sub(Section, 1, 7)
+    , SectionNo = str_sub(Section, 8, 10)
+  ) %>%
+  left_join(course_map, by = c('Course' = 'Course_Lookup')) %>%
+  mutate(
+    Course_Num = str_sub(Course, 5, 7)
+    , Dept = str_sub(Course, 1, 4)
+    , Instructor = str_replace(Instructor, "\\.", "")
+  ) %>%
+  mutate(
+    Instructor_Last = str_extract(Instructor, "[:alpha:]+(?=,)")
+    , Instructor_First = str_extract(Instructor, "(?<=,)[:alpha:]+")
+  ) %>%
+  select(Term, Dept, Course_Num, Course, Section, SectionNo, Course_Key, Title, Instructor, Instructor_Last, Instructor_First, question_type, question_abbr, value)
+```
+
+We then summarize the evaluations at a unique course and instructor level
+
+```{r evals_courses}
+evals_courses <-
+  evals_cleaned %>%
+  filter(Course == "OIDD515" | (Course_Num >= 600 & Course_Num < 900)) %>%  # All MBA classes have sections in 600/700/800s except Product Design
+  filter(SectionNo < 500) %>% # Remove WEMBA classes
+  filter(question_type == "Course") %>%
+  group_by(Term, Section, Course, Course_Key, question_abbr) %>%
+  summarise(value = mean(value)) %>%
+  ungroup() %>%
+  filter(!is.na(Course_Key)) %>%
+  group_by(Course_Key, question_abbr) %>%
+  summarise(
+    value = mean(value)
+    , sections_evaluated = n()
+  ) %>%
+  spread(question_abbr, value) %>%
+  ungroup()
+```
+
+```{r evals_instructors}
+evals_instructors <-
+  evals_cleaned %>%
+      filter(question_type == "Instructor") %>%
+      group_by(Instructor_Last, Instructor_First, question_abbr) %>%
+      summarise(
+        value = mean(value)
+        , sections_evaluated = n()
+        ) %>%
+      spread(question_abbr, value) %>%
+      ungroup() %>%
+  left_join(
+    evals_cleaned %>%
+      filter(Course == "OIDD515" | (Course_Num >= 600 & Course_Num < 900)) %>%  # All MBA classes have sections in 600/700/800s except Product Design
+      filter(SectionNo < 500) %>% # Remove WEMBA classes
+      filter(question_type == "Instructor") %>%
+      group_by(Instructor_Last, Instructor_First, question_abbr) %>%
+      summarise(
+        value = mean(value)
+        , sections_evaluated = n()
+        ) %>%
+      spread(question_abbr, value) %>%
+      ungroup()
+    , by = c("Instructor_Last", "Instructor_First")
+    , suffix = c("_all", "_mba")
+    ) %>%
+  select("Instructor_Last", "Instructor_First", "sections_evaluated_mba", "Instructor Quality_mba", "Ability to Communicate Subject Matter_mba", "Ability to Stimulate Interest_mba", "Instructor Accessibility_mba", "sections_evaluated_all", "Instructor Quality_all", "Ability to Communicate Subject Matter_all", "Ability to Stimulate Interest_all", "Instructor Accessibility_all")
+```
+
+```{r show_course_eval_cleaned, echo = FALSE}
+evals_cleaned %>% 
+  sample_n(10) %>% 
+  htmlTable(
+    rnames = FALSE
+    , caption = "10 sample rows from the tidied course evaluation data"
+    , css.cell = "padding-left: .5em; padding-right: .5em;"
+    , header = c('Term','Dept','Course Number','Course','Section','Section Number','Course Key','Title','Instructor','Instructor Last', 'Instructor First','Question Type', 'Question', "Value")
+    , align = c("cccccllclr")
+    , col.rgroup = c("none", "#F7F7F7")
+  )
+```
+
+# Summaries for Google Sheet
+
+We present that data at two levels of detail:
+
+1. **Course View**: Aggregate the reviews for all sections a course was taught
+2. **Instructor View**: Aggregate the reviews for all sections an instructor has taught
+
+We also create a "benchmark" that uses all historical data (not just the courses that will be taught in Fall 2019).
+
+## Course View
+
+```{r course_metrics}
+course_metrics <- 
+  course_quilt %>%
+  left_join(evals_courses, by = 'Course_Key') %>%
+  left_join(
+    clearing_prices %>%
+      left_join(course_map, by = c("Course" = "Course_Lookup")) %>% 
+      filter(!is.na(Course_Key)) %>%
+      group_by(Course_Key) %>%
+      summarise(clearing_price = mean(Price)) %>%
+      ungroup() %>%
+      mutate(percentile = percent_rank(clearing_price))
+    , by = 'Course_Key'
+  ) %>%
+  left_join(
+    evals_instructors %>%
+      select(Instructor_Last, Instructor_First, "Instructor Quality_1" = `Instructor Quality_mba`)
+    , by = c('Instructor_1_Last' = 'Instructor_Last', 'Instructor_1_First' = 'Instructor_First')
+  ) %>%
+  left_join(
+    evals_instructors %>%
+      select(Instructor_Last, Instructor_First, "Instructor Quality_2" = `Instructor Quality_mba`)
+    , by = c('Instructor_2_Last' = 'Instructor_Last', 'Instructor_2_First' = 'Instructor_First')
+  ) %>%
+  left_join(
+    evals_instructors %>%
+      select(Instructor_Last, Instructor_First, "Instructor Quality_3" = `Instructor Quality_mba`)
+    , by = c('Instructor_3_Last' = 'Instructor_Last', 'Instructor_3_First' = 'Instructor_First')
+  ) %>%
+  rowwise() %>%
+  mutate(Instructor_Quality_Avg = na_if(mean(x = c(`Instructor Quality_1`, `Instructor Quality_2`, `Instructor Quality_3`), na.rm = TRUE), "NaN")) %>%
+  ungroup() %>%
+  arrange(Section) %>%
+  select(Section, Course, SectionNo, Title, Instructor, Dept, CU, Days, Qtr, start_time, end_time, sections_evaluated, `Course Quality`, `Value of Assigned Readings`, `Amount Learned`, `Difficulty`, `Amount of Work Required`, `Recommend to Major`, `Recommend to Non-Major`, clearing_price, percentile, cross_listed_as, Instructor_Quality_Avg, Instructor_1, `Instructor Quality_1`, Instructor_2, `Instructor Quality_2`, Instructor_3, `Instructor Quality_3`) %>%
+  mutate(
+    sections_evaluated = replace_na(sections_evaluated, 0)
+  )
+```
+
+```{r course_benchmark}
+course_benchmark <- 
+  evals_cleaned %>%
+  filter(Course == "OIDD515" | (Course_Num >= 600 & Course_Num < 900)) %>%  # All MBA classes have sections in 600/700/800s except Product Design
+  filter(SectionNo < 500) %>% # Remove WEMBA classes
+  filter(question_type == "Course") %>%
+  group_by(question_abbr) %>%
+  summarise(
+    value = mean(value)
+    , sections_evaluated = n()
+  ) %>%
+  spread(question_abbr, value) %>%
+  bind_cols(
+    clearing_prices %>%
+      filter(str_sub(Course, 1, 4) != "WHCP") %>%
+      summarise(clearing_price = mean(Price))
+  )
+```
+
+## Instructor View
+
+```{r instructor_metrics} 
+instructor_metrics <- 
+  course_quilt %>%
+  distinct("Instructor_Last" = Instructor_1_Last, "Instructor_First" = Instructor_1_First) %>%
+  dplyr::union(
+    course_quilt %>%
+      distinct("Instructor_Last" = Instructor_2_Last, "Instructor_First" = Instructor_2_First)
+  ) %>%
+  dplyr::union(
+    course_quilt %>%
+      distinct("Instructor_Last" = Instructor_3_Last, "Instructor_First" = Instructor_3_First)
+  ) %>%
+  filter(Instructor_Last != 'STAFF' & !is.na(Instructor_Last)) %>%
+  left_join(
+    evals_instructors
+    , by = c("Instructor_Last", "Instructor_First")
+  ) %>%
+  mutate(
+    Instructor_Last = str_to_title(Instructor_Last)
+    , Instructor_First = str_to_title(Instructor_First)
+    , sections_evaluated_mba = replace_na(sections_evaluated_mba, 0)
+    , sections_evaluated_all = replace_na(sections_evaluated_all, 0)
+  ) %>%
+  arrange(Instructor_Last, Instructor_First)
+```
+
+```{r instructor_benchmark}
+instructor_benchmark <- 
+  evals_cleaned %>%
+  filter(Course == "OIDD515" | (Course_Num >= 600 & Course_Num < 900)) %>%  # All MBA classes have sections in 600/700/800s except Product Design
+  filter(SectionNo < 500) %>% # Remove WEMBA classes
+  filter(question_type == "Instructor") %>%
+  group_by(question_abbr) %>%
+  summarise(
+    value = mean(value)
+    , sections_evaluated = n()
+    ) %>%
+  spread(question_abbr, value) %>%
+  ungroup() %>%
+  bind_cols(
+    evals_cleaned %>%
+      filter(question_type == "Instructor") %>%
+      group_by(question_abbr) %>%
+      summarise(
+        value = mean(value)
+        , sections_evaluated = n()
+        ) %>%
+      spread(question_abbr, value) %>%
+      ungroup()
+    )
+```
+
+## Export to Google Sheet
+
+We then use the [googlesheets](https://cran.r-project.org/web/packages/googlesheets/) package to add them to the [Google Sheet](https://docs.google.com/spreadsheets/d/1DnAfsboI4Ucwdge8tRcG86ckb5WK5EdPd6FXdiqaesE)
+
+
+```{r update_google_sheet}
+if (params$external_queries) {
+  gs <- gs_key("1DnAfsboI4Ucwdge8tRcG86ckb5WK5EdPd6FXdiqaesE")
+  
+  # Course View tab
+  gs %>% gs_edit_cells(ws = "Course View", input = course_benchmark, anchor = "M3", col_names = FALSE)
+  gs %>% gs_edit_cells(ws = "Course View", input = course_metrics, anchor = "B4", col_names = FALSE)
+    
+  # Instructor View tab
+  gs %>% gs_edit_cells(ws = "Instructor View", input = instructor_benchmark, anchor = "D3", col_names = FALSE)
+  gs %>% gs_edit_cells(ws = "Instructor View", input = instructor_metrics, anchor = "B4", col_names = FALSE)
+}
+
+## Any way to export NA as blank?
+
+```
